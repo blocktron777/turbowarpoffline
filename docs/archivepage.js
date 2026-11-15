@@ -78,6 +78,25 @@
     r.readAsDataURL(blob);
   });
 
+  /**
+   * Decode a text blob with the right charset. Blob.text() / Response.text() always assume UTF-8,
+   * which silently corrupts Latin-1, Shift_JIS, etc. pages (the output is re-declared as UTF-8 later).
+   * Order: UTF-8 BOM -> charset in Content-Type -> <meta charset> / @charset -> UTF-8.
+   */
+  async function blobText(blob) {
+    const buf = await blob.arrayBuffer();
+    const b = new Uint8Array(buf, 0, Math.min(buf.byteLength, 3));
+    if (b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF) return new TextDecoder("utf-8").decode(buf);
+    let cs = (/charset\s*=\s*["']?([\w\-:.]+)/i.exec(blob.type || "") || [])[1];
+    if (!cs && /html|xml|css/i.test(blob.type || "")) {
+      const head = new TextDecoder("windows-1252").decode(buf.slice(0, 2048));
+      const m = /<meta[^>]+charset\s*=\s*["']?\s*([\w\-:.]+)/i.exec(head) || /^\s*@charset\s+["']([\w\-:.]+)["']/i.exec(head);
+      cs = m && m[1];
+    }
+    try { return new TextDecoder(cs || "utf-8").decode(buf); }
+    catch { return new TextDecoder("utf-8").decode(buf); }       // unknown charset label
+  }
+
   /** Async String.replace: all callbacks run in parallel, output is rebuilt by index (no `$` pitfalls). */
   async function replaceAsync(str, re, fn) {
     const matches = [...str.matchAll(re)];
@@ -139,7 +158,7 @@
     }
     return blobCache.get(href);
   }
-  const fetchText = async (href) => (await fetchBlob(href)).text();
+  const fetchText = async (href) => blobText(await fetchBlob(href));
   const toDataUrl = (href) => {
     if (!dataCache.has(href)) dataCache.set(href, fetchBlob(href).then(blobToDataUrl));
     return dataCache.get(href);
@@ -318,8 +337,11 @@
 
   async function processLink(o, c, ctx) {
     const rel = (o.getAttribute("rel") || "").toLowerCase().split(/\s+/);
-    if (rel.includes("stylesheet")) {
-      if (o.disabled || rel.includes("alternate")) { c.remove(); return; }
+    const onload = o.getAttribute("onload") || "";
+    // <link rel="preload" as="style" onload="this.rel='stylesheet'"> only becomes a stylesheet via script.
+    const lazySheet = rel.includes("preload") && (o.getAttribute("as") || "").toLowerCase() === "style" && /stylesheet/i.test(onload);
+    if (rel.includes("stylesheet") || lazySheet) {
+      if (o.disabled || (ctx.live && o.sheet && o.sheet.disabled) || rel.includes("alternate")) { c.remove(); return; }
       const href = abs(o.getAttribute("href"), ctx.base);
       if (!href) return;
       let css;
@@ -328,8 +350,15 @@
         css = ctx.live ? sheetText(o.sheet) : null;           // fall back to the browser's parsed copy
         if (css == null) { fail(href, e); c.setAttribute("href", href); return; }
       }
+      // loadCSS-style `media="print" onload="this.media='all'"`: that handler is not carried over to the
+      // <style>, so keeping media="print" would leave the CSS permanently inactive on screen.
+      const swapsMedia = /\bmedia\b/i.test(onload);
       const style = document.createElement("style");
-      for (const a of o.attributes) if (/^(?:id|media|data-.+)$/i.test(a.name)) style.setAttribute(a.name, a.value);
+      for (const a of o.attributes) {
+        if (!/^(?:id|media|data-.+)$/i.test(a.name)) continue;
+        if (a.name.toLowerCase() === "media" && swapsMedia) continue;
+        style.setAttribute(a.name, a.value);
+      }
       style.textContent = await inlineCss(css, href);
       c.replaceWith(style);
     } else if (rel.some((r) => /^(?:icon|shortcut|apple-touch-icon(?:-precomposed)?|mask-icon|apple-touch-startup-image)$/.test(r))) {
@@ -368,7 +397,9 @@
   function processImg(o, c, ctx) {
     const parent = o.parentElement;
     const pic = parent && parent.localName === "picture" ? parent.querySelector("source[srcset]") : null;
-    const first = (set) => (set || "").split(",")[0].trim().split(/\s+/)[0];
+    // First srcset candidate = first whitespace-delimited token. (Splitting on "," breaks CDN URLs like
+    // ".../w_300,c_fill/img.jpg"; a trailing comma only appears when the candidate has no descriptor.)
+    const first = (set) => (set || "").trim().split(/\s+/)[0].replace(/,+$/, "");
     const src = ctx.live
       ? (o.currentSrc || o.getAttribute("src"))                // the candidate the browser actually chose
       : (o.getAttribute("src") || first(o.getAttribute("srcset")) || (pic && first(pic.getAttribute("srcset"))));
@@ -396,7 +427,7 @@
       try {
         const b = await fetchBlob(href);
         if (!/html|xml/i.test(b.type)) { c.setAttribute("src", await blobToDataUrl(b)); return; }
-        doc = new DOMParser().parseFromString(await b.text(), "text/html");
+        doc = new DOMParser().parseFromString(await blobText(b), "text/html");
         fbase = docBase(doc, href);
       } catch (e) { fail(href, e); c.setAttribute("src", href); return; }
     }
@@ -437,7 +468,7 @@
       case "video": inlineAttr(c, "poster", ctx); inlineAttr(c, "src", ctx); break;
       case "audio": case "track": case "embed": inlineAttr(c, "src", ctx); break;
       case "object": inlineAttr(c, "data", ctx); break;
-      case "image": case "use": case "feimage":
+      case "image": case "use": case "feImage":               // SVG localNames are case-sensitive ("feImage")
         inlineAttr(c, "href", ctx); inlineAttr(c, "xlink:href", ctx); break;
       case "iframe": case "frame": T(processFrame(o, c, ctx)); break;
       case "canvas":
@@ -459,7 +490,8 @@
         else c.setAttribute("value", o.value);
         break;
       }
-      case "textarea": if (ctx.live) c.textContent = o.value; break;
+      // The HTML parser drops one leading newline inside <textarea>, so prefix one to keep the value intact.
+      case "textarea": if (ctx.live) c.textContent = "\n" + o.value; break;
       case "select":
         if (ctx.live) [...o.options].forEach((op, i) => {
           const co = c.options && c.options[i];
@@ -609,8 +641,8 @@ try{
     await Promise.all(urls.map(async (u) => {
       try {
         let blob = await fetchBlob(u);
-        if (/^text\/css/i.test(blob.type)) blob = new Blob([await inlineCss(await blob.text(), u)], { type: "text/css" });
-        else if (/javascript/i.test(blob.type)) scanForWorkers(await blob.text(), base);   // lazily loaded chunks
+        if (/^text\/css/i.test(blob.type)) blob = new Blob([await inlineCss(await blobText(blob), u)], { type: "text/css" });
+        else if (/javascript/i.test(blob.type)) scanForWorkers(await blobText(blob), base);   // lazily loaded chunks
         byUrl[u] = data.push(await blobToDataUrl(blob)) - 1;
       } catch (e) { fail(u, e); }
     }));
@@ -636,7 +668,7 @@ try{
       const res = await fetch(location.href, { credentials: "include", cache: "force-cache" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       if (!/html/i.test(res.headers.get("content-type") || "")) throw new Error("response is not HTML");
-      srcDoc = new DOMParser().parseFromString(await res.text(), "text/html");
+      srcDoc = new DOMParser().parseFromString(await blobText(await res.blob()), "text/html");
       base = docBase(srcDoc, location.href);
       live = false;
     } catch (e) {
